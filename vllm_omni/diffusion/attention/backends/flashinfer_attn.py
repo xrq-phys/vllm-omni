@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
 
@@ -312,7 +312,10 @@ class FlashInferAttentionImpl(AttentionImpl):
             q = q.to(self.dtype_qk)
             k = k.to(self.dtype_qk)
         if self.dtype_vo is not None:
-            v = v.to(self.dtype_vo)
+            scale_v_ch = v.abs().amax(dim=0, keepdim=True).clamp(min=1e-6) / torch.finfo(self.dtype_vo).max
+            v = (v * torch.reciprocal(scale_v_ch.float()).to(v.dtype)).to(self.dtype_vo)
+        else:
+            scale_v_ch = None
 
         flat_mask = None
         if custom_mask is not None:
@@ -341,6 +344,9 @@ class FlashInferAttentionImpl(AttentionImpl):
             flat_mask,
         )
         out = self._run_wrapper(q, k, v)
+        if scale_v_ch is not None:
+            out = out.unflatten(-2, (num_kv_heads, -1))
+            out = out * scale_v_ch[:, :, None, :]
         out = out.reshape(batch_size, qo_len, num_q_heads, head_dim_vo)
         return out.to(query.dtype) if out.dtype != query.dtype else out
 
