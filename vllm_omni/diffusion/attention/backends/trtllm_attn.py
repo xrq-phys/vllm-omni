@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import functools
 import inspect
@@ -193,7 +193,11 @@ class TrtllmAttentionImpl(AttentionImpl):
         self.skip = SkipSoftmaxConfig.from_backend_kwargs(backend_kwargs)
         self._warned_missing_timestep = False
 
-        self.quant = QuantConfig.from_backend_kwargs(backend_kwargs)
+        # Override: SageAttention does not support causal attention
+        if causal:
+            self.quant = QuantConfig(dtype_qk=None, q_block_size=0, k_block_size=0)
+        else:
+            self.quant = QuantConfig.from_backend_kwargs(backend_kwargs)
         # Resolve the SAGE quantize fn once at init so the compiled forward path never calls the
         # lru_cache-wrapped getter (which triggers a Dynamo graph break every step).
         self._sage_quantize_fn = None
@@ -359,17 +363,8 @@ class TrtllmAttentionImpl(AttentionImpl):
         # SAGE quant is active (which already requires the kernel, checked at init) so the dense
         # path stays compatible with older builds that lack these parameters.
         sage_kwargs: dict = {}
-        # The SAGE kernel requires every KV sequence to contain at least one full
-        # quantization block. Small auxiliary attention sites use the dense kernel.
-        use_sage = self.quant.enabled and bool(torch.all(seq_lens >= self.quant.k_block_size).item())
-        if self.quant.enabled and not use_sage:
-            message = (
-                f"TRTLLM_ATTN SAGE quantization is configured for attention role {self.role!r}, but at least one "
-                f"KV sequence is shorter than k_block_size={self.quant.k_block_size}. Falling back to dense "
-                "attention for this input."
-            )
-            logger.warning_once(message)
-        if use_sage:
+        if self.quant.enabled:
+            k = k - k.mean(dim=0, keepdim=True)
             q, k, v, sage_attn_sfs, sage_block_sizes = self.quant.quantize(q, k, v, self._sage_quantize_fn)
             sage_kwargs["sage_attn_sfs"] = sage_attn_sfs
             sage_kwargs["num_elts_per_sage_attn_blk"] = sage_block_sizes
