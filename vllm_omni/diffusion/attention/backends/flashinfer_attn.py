@@ -56,6 +56,7 @@ class FlashInferAttentionBackend(AttentionBackend):
 class FlashInferAttentionImpl(AttentionImpl):
     _QK_DTYPES = {torch.float16, torch.bfloat16}
     _VO_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
+    _AUX_STREAMS: dict[int, torch.cuda.Stream] = {}
 
     @dataclass(frozen=True)
     class _WrapperPlanKey:
@@ -93,6 +94,7 @@ class FlashInferAttentionImpl(AttentionImpl):
         quant = backend_kwargs.get("quant") or {} if not causal else {}
         self.dtype_qk = self._check_dtype(quant.get("dtype_qk"), "dtype_qk", self._QK_DTYPES)
         self.dtype_vo = self._check_dtype(quant.get("dtype_vo"), "dtype_vo", self._VO_DTYPES)
+        self.aux_stream = self._get_aux_stream(self.device)
         requested_backend = quant.get("flashinfer_backend", "auto")
 
         if not HAS_FLASHINFER:
@@ -170,15 +172,51 @@ class FlashInferAttentionImpl(AttentionImpl):
             raise ValueError(f"Unsupported {option_name}={dtype}; expected one of: {choices}")
         return dtype
 
+    @classmethod
+    def _get_aux_stream(cls, device) -> torch.cuda.Stream:
+        if device.index not in cls._AUX_STREAMS:
+            cls._AUX_STREAMS[device.index] = torch.cuda.Stream(device=device)
+        return cls._AUX_STREAMS[device.index]
+
     @staticmethod
-    def _per_tensor_quantize(
+    @torch.compile
+    def _per_tensor_quantize_exec(
+        tensor: torch.Tensor,
+        scale_tensor: torch.Tensor,
+        to_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return (tensor * torch.reciprocal(scale_tensor).to(tensor.dtype)).to(to_dtype)
+
+    @torch.compiler.disable
+    def _per_tensor_quantize_move_scales(
+        self,
+        tensor: torch.Tensor,
+        scale_tensor: torch.Tensor,
+        to_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, float]:
+        curr_stream = torch.cuda.current_stream()
+        self.aux_stream.wait_stream(curr_stream)
+        tensor.record_stream(self.aux_stream)
+        scale_tensor.record_stream(self.aux_stream)
+        with torch.cuda.stream(self.aux_stream):
+            tensor_quantized = self._per_tensor_quantize_exec(tensor, scale_tensor, to_dtype)
+
+        # Moves scale tensor to the host.
+        scale_value = scale_tensor.item()
+        # Wait for quantization to finish.
+        curr_stream.wait_stream(self.aux_stream)
+        tensor_quantized.record_stream(curr_stream)
+
+        return tensor_quantized, scale_value
+
+    def _per_tensor_quantize_dynamic(
+        self,
         tensor: torch.Tensor,
         to_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, float | torch.Tensor]:
+    ) -> tuple[torch.Tensor, float]:
         if torch.finfo(to_dtype).bits == 8:
             scale_tensor = tensor.abs().amax().float().clamp_min(1e-6) / torch.finfo(to_dtype).max
-            tensor = tensor * torch.reciprocal(scale_tensor).to(tensor.dtype)
-            return tensor.to(to_dtype), scale_tensor
+            return self._per_tensor_quantize_move_scales(tensor, scale_tensor, to_dtype)
         return tensor.to(to_dtype), 1.0
 
     @staticmethod
@@ -319,9 +357,9 @@ class FlashInferAttentionImpl(AttentionImpl):
         q = query.reshape(batch_size * qo_len, num_q_heads, head_dim_qk)
         k = key.reshape(batch_size * kv_len, num_kv_heads, head_dim_k)
         v = value.reshape(batch_size * kv_len, num_kv_heads, head_dim_vo)
-        q, q_scale = self._per_tensor_quantize(q, self.dtype_qk or q.dtype)
-        k, k_scale = self._per_tensor_quantize(k, self.dtype_qk or k.dtype)
-        v, v_scale = self._per_tensor_quantize(v, self.dtype_vo or v.dtype)
+        q, q_scale = self._per_tensor_quantize_dynamic(q, self.dtype_qk or q.dtype)
+        k, k_scale = self._per_tensor_quantize_dynamic(k, self.dtype_qk or k.dtype)
+        v, v_scale = self._per_tensor_quantize_dynamic(v, self.dtype_vo or v.dtype)
 
         flat_mask = None
         if custom_mask is not None:
@@ -359,16 +397,10 @@ class FlashInferAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        q_scale: float | torch.Tensor,
-        k_scale: float | torch.Tensor,
-        v_scale: float | torch.Tensor,
+        q_scale: float,
+        k_scale: float,
+        v_scale: float,
     ) -> torch.Tensor:
-        if isinstance(q_scale, torch.Tensor):
-            q_scale = q_scale.item()
-        if isinstance(k_scale, torch.Tensor):
-            k_scale = k_scale.item()
-        if isinstance(v_scale, torch.Tensor):
-            v_scale = v_scale.item()
         try:
             return self._wrapper.run(
                 query,
