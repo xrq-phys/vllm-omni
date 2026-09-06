@@ -90,7 +90,7 @@ class FlashInferAttentionImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
         self.device = torch.device("cuda", torch.accelerator.current_device_index())
         backend_kwargs = backend_kwargs or {}
-        quant = backend_kwargs.get("quant") or {}
+        quant = backend_kwargs.get("quant") or {} if not causal else {}
         self.dtype_qk = self._check_dtype(quant.get("dtype_qk"), "dtype_qk", self._QK_DTYPES)
         self.dtype_vo = self._check_dtype(quant.get("dtype_vo"), "dtype_vo", self._VO_DTYPES)
         requested_backend = quant.get("flashinfer_backend", "auto")
