@@ -44,7 +44,8 @@ class SkipSoftmaxConfig:
             target_sparsity=_validate_control(bk.get("target_sparsity"), "target_sparsity", 0.0, 1.0),
             disabled_until_timestep=_validate_control(
                 bk.get("disabled_until_timestep", 0.0), "disabled_until_timestep", 0.0, 1.0
-            ),
+            )
+            or 0.0,
         )
 
     @property
@@ -131,14 +132,16 @@ class QuantConfig:
         return self.dtype_qk is not None
 
     def quantize(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, quantize_fn):
+        assert self.dtype_qk is not None, "quantize() called with quantization disabled"
         qk_quant_dtype = _QK_QUANT_DTYPES[self.dtype_qk]
-        q_q, k_q, v_q, q_sfs, k_sfs, v_sfs = quantize_fn(
+        q_q, k_q, v_q, q_sfs, k_sfs, v_sfs, k_mean = quantize_fn(
             q,
             k,
             v,
             q_block_size=self.q_block_size,
             k_block_size=self.k_block_size,
             qk_quant_dtype=qk_quant_dtype,
+            smooth_k=True,
         )
         sage_attn_sfs = (q_sfs, k_sfs, None, v_sfs)
         num_elts_per_sage_attn_blk = (self.q_block_size, self.k_block_size, 0, 1)
@@ -364,7 +367,6 @@ class TrtllmAttentionImpl(AttentionImpl):
         # path stays compatible with older builds that lack these parameters.
         sage_kwargs: dict = {}
         if self.quant.enabled:
-            k = k - k.mean(dim=0, keepdim=True)
             q, k, v, sage_attn_sfs, sage_block_sizes = self.quant.quantize(q, k, v, self._sage_quantize_fn)
             sage_kwargs["sage_attn_sfs"] = sage_attn_sfs
             sage_kwargs["num_elts_per_sage_attn_blk"] = sage_block_sizes
@@ -388,6 +390,7 @@ class TrtllmAttentionImpl(AttentionImpl):
             is_causal=self.causal,
             return_lse=False,
             skip_softmax_threshold_scale_factor=_skip_factor,
+            skip_all_rows_active_check=True,
             **sage_kwargs,
         )
         if out.shape[0] != output_tokens:
