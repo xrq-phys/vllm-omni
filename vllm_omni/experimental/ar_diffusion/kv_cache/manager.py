@@ -42,6 +42,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.config import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowManager,
     ChunkWindowSpec,
+    FramePageSpec,
     allocate_kv_pool_with_views,
     chunk_slot_mapping,
     pool_write_chunk,
@@ -313,6 +314,7 @@ class ARDiffusionKVCache:
         max_scratch_frames_per_branch: int | None = None,
         max_scratch_tokens_per_branch: int = 0,
         model_owned_state_bytes_per_session: int = 0,
+        fa4_frame_pages: bool = False,
     ) -> None:
         if not config.enable:
             raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
@@ -335,6 +337,9 @@ class ARDiffusionKVCache:
             )
 
         self.config = config
+        self.fa4_frame_pages = bool(fa4_frame_pages)
+        if self.fa4_frame_pages and block_size != config.chunk_size:
+            raise ValueError("FA4 frame-page size must equal tokens per frame")
         self.kv_branches = kv_branches
         self.requested_session_capacity = session_capacity
         self._kv_branch_local_indices = {kv_branch.name: kv_branch.local_index for kv_branch in kv_branches}
@@ -384,7 +389,8 @@ class ARDiffusionKVCache:
             dict[str, dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]]],
         ] = {}
 
-        self.spec = ChunkWindowSpec(
+        spec_cls = FramePageSpec if self.fa4_frame_pages else ChunkWindowSpec
+        self.spec = spec_cls(
             block_size=block_size,
             num_kv_heads=num_kv_heads,
             head_size=head_size,
@@ -478,7 +484,7 @@ class ARDiffusionKVCache:
         # contiguous-gather attention path consumes it.
         self.history_staging_reserved_bytes = 0
         self.history_staging_tokens = 0
-        if config.reuse_history_staging:
+        if config.reuse_history_staging and not self.fa4_frame_pages:
             if contiguous_kv_gather_enabled():
                 # The same width build_block_table pads to: a sink or window
                 # that is not a whole number of blocks spans one more block.
@@ -861,13 +867,14 @@ class ARDiffusionKVCache:
         """
         _log.debug("AR-Diffusion commit: req=%s before=%d", adapter.request_id, adapter.completed_chunks)
         adapter.on_chunk_committed()
-        self.manager.remove_skipped_blocks(
-            adapter.request_id,
-            adapter.num_computed_tokens,
-            num_prompt_tokens=adapter.num_prompt_tokens,
-        )
-        window_manager = cast(ChunkWindowManager, self.manager.coordinator.single_type_managers[0])
-        adapter.compacted_tokens += window_manager.compact_block_table(adapter.request_id)
+        if not self.fa4_frame_pages:
+            self.manager.remove_skipped_blocks(
+                adapter.request_id,
+                adapter.num_computed_tokens,
+                num_prompt_tokens=adapter.num_prompt_tokens,
+            )
+            window_manager = cast(ChunkWindowManager, self.manager.coordinator.single_type_managers[0])
+            adapter.compacted_tokens += window_manager.compact_block_table(adapter.request_id)
         _log.debug("AR-Diffusion commit: req=%s after=%d", adapter.request_id, adapter.completed_chunks)
 
     # -- pool-backed K/V access --------------------------------------------

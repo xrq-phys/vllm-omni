@@ -28,7 +28,10 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     SupportsDynamicARDiffusion,
     supports_chunk_step_grouping,
 )
-from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
+from vllm_omni.experimental.ar_diffusion.kv_cache.config import (
+    ARDiffusionKVConfig,
+    cosmos_sim_fa4_frame_pages_enabled,
+)
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import (
     ARDiffusionKVCache,
     ar_diffusion_scratch_blocks_override,
@@ -213,7 +216,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 effective,
                 self.od_config.dtype,
                 scratch_blocks_override=ar_diffusion_scratch_blocks_override(),
-                block_size=paging_block_size(effective.tokens_per_frame),
+                block_size=(
+                    effective.tokens_per_frame
+                    if getattr(self, "_fa4_frame_pages", False)
+                    else paging_block_size(effective.tokens_per_frame)
+                ),
             )
             if estimate.required_bytes > available_bytes:
                 raise ValueError(
@@ -241,6 +248,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 f"rollouts); got max_num_seqs={max_num_seqs}."
             )
         capability = self._require_capability(self.pipeline)
+        fa4_frame_pages = cosmos_sim_fa4_frame_pages_enabled()
+        if fa4_frame_pages and type(self.pipeline).__name__ != "Cosmos3NanoSimBimanualPipeline":
+            raise ValueError("FA4 frame pages are only supported for Cosmos3-Nano-Sim-Bimanual")
+        self._fa4_frame_pages = fa4_frame_pages
         if bool(getattr(self.pipeline, "supports_request_batch", False)):
             raise ValueError(
                 "ARDiffusionModelRunner currently supports one request at a time; "
@@ -278,7 +289,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             num_kv_heads=spec.num_kv_heads,
             head_size=spec.head_size,
             dtype=self.od_config.dtype,
-            block_size=paging_block_size(spec.tokens_per_frame),
+            block_size=spec.tokens_per_frame if fa4_frame_pages else paging_block_size(spec.tokens_per_frame),
             max_model_len=spec.max_model_len,
             available_bytes=budget,
             kv_branches=spec.kv_branches,
@@ -290,6 +301,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
             model_owned_state_bytes_per_session=spec.model_owned_state_bytes_per_session,
             device=self.device,
+            fa4_frame_pages=fa4_frame_pages,
         )
         self._session_capacity = self.kv_cache.session_capacity
         logger.info(

@@ -8,6 +8,11 @@ import os
 from dataclasses import dataclass
 
 KV_GATHER_ENV = "VLLM_OMNI_AR_DIFFUSION_KV_GATHER"
+COSMOS_SIM_FA4_FRAME_PAGES_ENV = "VLLM_OMNI_COSMOS_SIM_FA4_FRAME_PAGES"
+
+
+def cosmos_sim_fa4_frame_pages_enabled() -> bool:
+    return os.environ.get(COSMOS_SIM_FA4_FRAME_PAGES_ENV, "0") == "1"
 
 
 def contiguous_kv_gather_enabled() -> bool:

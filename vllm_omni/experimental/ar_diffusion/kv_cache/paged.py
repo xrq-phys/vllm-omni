@@ -22,8 +22,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
-from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
-from vllm.v1.kv_cache_interface import SlidingWindowSpec
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 from vllm.v1.kv_cache_spec_registry import register_kv_cache_spec
 
 # ── Slot mapping ────────────────────────────────────────────────────────────
@@ -317,3 +317,14 @@ class ChunkWindowSpec(SlidingWindowSpec):
                 f"window_chunks * chunk_size ({self.window_chunks} * "
                 f"{self.chunk_size}), got {self.sliding_window}"
             )
+
+
+@register_kv_cache_spec(manager_class=FullAttentionManager, uniform_type_base_spec=FullAttentionSpec)
+@dataclass(frozen=True, kw_only=True)
+class FramePageSpec(FullAttentionSpec):
+    """Ordinary vLLM allocation; visibility is selected by the attention table."""
+
+    chunk_size: int
+    window_chunks: int
+    sink_chunks: int = 0
+    reset_at_boundary: bool = False

@@ -73,6 +73,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionRequestKVSpec,
     ARDiffusionRequestRejectedError,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.config import cosmos_sim_fa4_frame_pages_enabled
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
@@ -216,6 +217,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     _vae_decode_stream: torch.cuda.Stream | None = None
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
+        self._fa4_frame_pages_requested = cosmos_sim_fa4_frame_pages_enabled()
         self._ar_compile_mode = resolve_ar_compile_mode(od_config)
         validate_sim_parallel_config(od_config)
         super().__init__(od_config=od_config, prefix=prefix)
@@ -723,6 +725,10 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     ) -> Cosmos3NanoSimBimanualTransformerOutput:
         paged_state = self._ar_diffusion_kv_state
         tokens_per_frame = geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame)
+        if getattr(self, "_fa4_frame_pages_requested", False) and (
+            paged_state is None or not paged_state.kv_cache.fa4_frame_pages
+        ):
+            raise RuntimeError("FA4 frame pages require the ARDiffusionEngine; no dense fallback is permitted")
         seq_len = hidden_states.shape[2] * tokens_per_frame
         paged_kv = None
         dense_history = None

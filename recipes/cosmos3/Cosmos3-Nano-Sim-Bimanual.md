@@ -100,3 +100,129 @@ checkpoint, `first_steps=1` and `last_steps=1` select A16/native/native/A16.
 This does not enable quantization for BF16 checkpoints. See the
 [ModelOpt configuration](../../docs/user_guide/quantization/modelopt.md#cosmos3-mixed-precision-schedule)
 for artifact requirements and how to enable the policy.
+
+## Experimental FA4 frame pages
+
+Set `VLLM_OMNI_COSMOS_SIM_FA4_FRAME_PAGES=1` with the AR-Diffusion deployment
+to use one latent frame per page. At 720×1280, the patch grid is 23×40:
+920 video tokens plus 4 interleaved action tokens gives **924 tokens/page**.
+This path calls the installed `flash_attn.cute.flash_attn_varlen_func` with
+`page_table` and `seqused_k` directly. Unsupported kernels fail; attention does
+not fall back to another backend or gather history into contiguous K/V.
+
+Each row lists protected sink pages, recent frame pages, current frame pages,
+then separate text pages of the same size. Every frame and the first text
+token start at page offset zero. Sequence lengths exclude the unused suffix
+of the final text page. Batched clean refresh uses one row per frame so later
+frames stay invisible to earlier queries.
+
+The experiment uses vLLM's ordinary full-attention allocator. Sink/window
+visibility is enforced by the attention block table; generated pages remain
+allocated until the session ends. Memory grows with history, and a rollout
+that exhausts the pool fails. Use short rollouts; bounded-memory reclamation
+is not implemented for this path. The contiguous-history staging option is
+ignored while the experiment is enabled.
+
+After the checkpoint is cached, run the same 720p AgiBot example with both paths:
+
+```bash
+export HF_HOME=/home/scratch.ruqingx_research/cosmos-checkpoints
+PYTHON=/home/scratch.ruqingx_research/vllm-omni/.venv/bin/python
+
+VLLM_OMNI_COSMOS_SIM_FA4_FRAME_PAGES=0 "$PYTHON" \
+  benchmarks/diffusion/bench_cosmos_sim_frame_pages.py --output-dir "$PWD/var/cosmos-sim-fa4-frame-pages/results"
+VLLM_OMNI_COSMOS_SIM_FA4_FRAME_PAGES=1 "$PYTHON" \
+  benchmarks/diffusion/bench_cosmos_sim_frame_pages.py --output-dir "$PWD/var/cosmos-sim-fa4-frame-pages/results"
+```
+
+The harness saves raw frames, an MP4, deployment settings, and a run report for
+each path. It uses 25 pixel frames, seed 2026, the checkpoint's four-step
+schedule, one sink frame, and two recent past frames to exercise sliding
+visibility. The run report records the installed FA4 version. The GPU op test
+also prints CUDA kernel names:
+
+```bash
+"$PYTHON" -m pytest -s \
+  tests/diffusion/models/cosmos3_nano_sim_bimanual/test_fa4_frame_pages.py
+```
+
+### SM103 validation
+
+Validated on SM103 with PyTorch `2.13.0+cu132` and installed `flash-attn-4`
+`4.0.0b33`. CUDA profiling records the installed package's
+`FlashAttentionForwardSm100` kernel with 924-token pages, 32 query heads,
+8 KV heads, and head dimension 128. No FA4 source patch was needed.
+
+For the harness's 25-frame 720p rollout, the generated frames (excluding the
+initial condition) have **49.34 dB raw-float RGB PSNR** and **0.998801 RGB8
+SSIM** against the existing paged implementation. The inspected frames show
+equivalent visual quality in this short sample; the outputs are not
+bit-identical. The harness uses the reference prompt's first three sentences
+to stay within the checkpoint's 512-token text cache, with guidance 1.0.
+
+This development node also had an unrelated TorchAudio CUDA-version mismatch.
+Validation used the temporary process-local helper
+`$PWD/var/cosmos-sim-fa4-frame-pages/source/compat/sitecustomize.py` through
+`PYTHONPATH=$PWD/var/cosmos-sim-fa4-frame-pages/source/compat:$PWD`;
+installed packages were not changed.
+Videos, raw frames, the side-by-side comparison, and the detailed report are
+under `$PWD/var/cosmos-sim-fa4-frame-pages/results/`. Restored source, environment
+settings, and the complete rerun command are under the sibling `source/`
+directory; `bash var/cosmos-sim-fa4-frame-pages/source/run.sh` repeats both
+rollouts and the comparison. The environment file routes temporary files and
+compiler caches into the experiment directory as well.
+
+### Longer rollouts and Nsight Systems profiles
+
+The 25-frame rollout already advances the attention window: temporal compression
+is 4, so it contains 7 latent frames. With one sink and two recent past frames,
+the clean attention row first excludes latent frame 1 when processing frame 4
+(zero-based). The FA4 experiment retains physical pages while advancing visibility.
+
+The local experiment's `source/profile_long.sh` profiles paired 241-frame
+rollouts (61 latent frames, 8.03 seconds at 30 fps), each after a 25-frame warmup:
+
+```bash
+bash var/cosmos-sim-fa4-frame-pages/source/profile_long.sh
+```
+
+Outputs are under `$PWD/var/cosmos-sim-fa4-frame-pages/profile_241/`, including
+`baseline.nsys-rep`, `fa4_frame_pages.nsys-rep`, videos, window metadata audits,
+and exported statistics. The script uses
+`/home/scratch.ruqingx_gpu_1/nsys-2026.3.1.157-x64/bin/nsys` with CUDA, NVTX, and
+OS runtime tracing. CPU sampling, context switches, CPU symbol resolution, and
+remote debuginfod downloads are disabled. The parent-process `cosmos.generate`
+NVTX range brackets generation across the worker processes; `cosmos.warmup`
+labels warmup. Model startup and MP4 export are outside the measured range.
+`profile_summary.json` uses that timestamp interval to count worker CUDA kernels.
+
+The environment uses a short workspace symlink, `var/c3fa4-tmp`, pointing into
+the experiment's `tmp/` directory to keep UNIX socket paths under 107 bytes.
+
+For the profiled 241-frame pair, generation after warmup took 27.51 seconds
+(reference) and 27.45 seconds (FA4), with no material difference in these single
+observations. The FA4 generation interval contains 6,480 installed FA4 SM100
+kernel launches on SM103. Generated-frame agreement decreases over the longer
+rollout: 29.58 dB PSNR and 0.963029 RGB8 SSIM. The initial frames match exactly,
+then the outputs diverge. The audited reference includes 0, 4, 8, 12, or 16 extra
+visible tokens at its page boundaries; FA4 uses exact frame boundaries. Thus
+these paths do not always attend to identical token sets. The longer result
+does not establish numerical equivalence from the short sample.
+
+To profile regional `torch.compile` execution separately from the eager pair:
+
+```bash
+bash var/cosmos-sim-fa4-frame-pages/source/profile_compiled.sh
+```
+
+This writes to `profile_241_compiled/`, sets `enforce_eager=False`, enables
+dynamic regional Inductor compilation, and keeps CUDA graphs disabled. Two
+25-frame warmups precede each measured 241-frame rollout. Worker-side
+`*.compile.jsonl` audits require all transformer blocks to have compiled
+forwards; the summary rejects measurements with new Dynamo/Inductor compilation
+and requires fused Inductor kernels in the trace.
+
+For this compiled pair, measured generation took 25.33 seconds (reference) and
+25.15 seconds (FA4). Both use 36 compiled transformer blocks and four graph
+variants, with no graph breaks or new compilation during measurement. These
+are single profiled observations with CUDA graphs disabled.

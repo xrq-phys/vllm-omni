@@ -6,9 +6,12 @@ from __future__ import annotations
 
 import weakref
 from dataclasses import dataclass, field
+from functools import lru_cache
+from importlib.metadata import version
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import contiguous_kv_gather_enabled
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping, visible_window_blocks
@@ -17,6 +20,22 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backend import MultipleOf
 
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
+_log = init_logger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _fa4_paged_func():
+    from flash_attn.cute import flash_attn_varlen_func
+    from flash_attn.cute.interface import _get_device_arch
+
+    _log.info(
+        "Experimental Cosmos Sim frame pages: flash-attn-4=%s API=%s.%s arch=SM%d; paged K/V, no fallback",
+        version("flash-attn-4"),
+        flash_attn_varlen_func.__module__,
+        flash_attn_varlen_func.__name__,
+        _get_device_arch(),
+    )
+    return flash_attn_varlen_func
 
 
 def _layer_idx_tensor(layer_idx: int) -> torch.Tensor:
@@ -77,6 +96,7 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     stage_first_block: int = 0
     tail_source_slots: torch.Tensor | None = None
     tail_destination_slots: torch.Tensor | None = None
+    fa4_frame_pages: bool = False
 
 
 @dataclass
@@ -563,6 +583,7 @@ class ARDiffusionPagedForwardContext:
             stage_first_block=int(self.stage_first_block),
             tail_source_slots=self.tail_source_slots,
             tail_destination_slots=self.tail_destination_slots,
+            fa4_frame_pages=getattr(self.kv_cache, "fa4_frame_pages", False),
         )
 
     def mark_committed(self) -> None:
@@ -754,6 +775,7 @@ def ar_diffusion_paged_attention(
     reuse_history: bool = False,
     current_tokens: int = 0,
     stage_first_block: int = 0,
+    fa4_frame_pages: bool = False,
 ) -> torch.Tensor:
     """Run non-causal paged attention over a vLLM block table.
 
@@ -766,6 +788,9 @@ def ar_diffusion_paged_attention(
         query_flat = query.reshape(batch * q_len, *query.shape[2:])
     else:
         query_flat = query
+
+    if fa4_frame_pages and not query_flat.is_cuda:
+        raise RuntimeError("FA4 frame pages require CUDA; no attention fallback is permitted")
 
     if framewise_attention and query_start_loc.numel() > 2:
         # Preserve the single-frame backend dispatch, including automatic KV
@@ -787,6 +812,7 @@ def ar_diffusion_paged_attention(
                 max_seq_len=max_seq_len,
                 softmax_scale=softmax_scale,
                 causal=causal,
+                fa4_frame_pages=fa4_frame_pages,
             )
             for frame in range(num_frames)
         ]
@@ -800,6 +826,21 @@ def ar_diffusion_paged_attention(
             query_start_loc,
             seq_lens,
             softmax_scale,
+            causal=causal,
+        )
+    elif fa4_frame_pages:
+        if current_tokens % key_cache.shape[1]:
+            raise ValueError("FA4 frame-page current K/V must contain whole frames")
+        out, _ = _fa4_paged_func()(
+            q=query_flat,
+            k=key_cache,
+            v=value_cache,
+            cu_seqlens_q=query_start_loc,
+            seqused_k=seq_lens,
+            page_table=block_table,
+            max_seqlen_q=int(max_query_len),
+            max_seqlen_k=int(max_seq_len),
+            softmax_scale=float(softmax_scale),
             causal=causal,
         )
     elif torch.version.hip is not None:
@@ -966,6 +1007,7 @@ def _paged_write_attn_impl(
     framewise_attention: bool = False,
     tail_source_slots: torch.Tensor | None = None,
     tail_destination_slots: torch.Tensor | None = None,
+    fa4_frame_pages: bool = False,
 ) -> torch.Tensor:
     key_pool[video_slots] = k_curr.to(key_pool.dtype)
     value_pool[video_slots] = v_curr.to(value_pool.dtype)
@@ -994,6 +1036,7 @@ def _paged_write_attn_impl(
         reuse_history=reuse_history,
         current_tokens=int(k_curr.shape[0]),
         stage_first_block=stage_first_block,
+        fa4_frame_pages=fa4_frame_pages,
     )
 
 
@@ -1031,6 +1074,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         framewise_attention: bool,
         tail_source_slots: torch.Tensor | None,
         tail_destination_slots: torch.Tensor | None,
+        fa4_frame_pages: bool,
     ) -> torch.Tensor:
         return _paged_write_attn_impl(
             query,
@@ -1056,6 +1100,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
             framewise_attention,
             tail_source_slots,
             tail_destination_slots,
+            fa4_frame_pages,
         )
 
     @_paged_write_attn_op.register_fake
@@ -1083,6 +1128,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         framewise_attention=False,
         tail_source_slots=None,
         tail_destination_slots=None,
+        fa4_frame_pages=False,
     ):
         return torch.empty_like(query)
 
@@ -1123,4 +1169,5 @@ def paged_write_attn(
         framewise_attention,
         inputs.tail_source_slots,
         inputs.tail_destination_slots,
+        inputs.fa4_frame_pages,
     )
