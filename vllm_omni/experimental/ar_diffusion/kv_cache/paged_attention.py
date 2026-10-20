@@ -75,6 +75,8 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     # Index of the current chunk's first block within the staged window: right after the visible history,
     # which is not the end of the padded block table (that carries at least one action-capacity block).
     stage_first_block: int = 0
+    # Require a backend that consumes the physical page table directly.
+    require_paged: bool = False
 
 
 @dataclass
@@ -656,29 +658,17 @@ def _resolve_fa_version(head_size: int) -> int:
 
 
 def supported_kernel_block_sizes() -> list[int | MultipleOf]:
-    """Block sizes the kernel this module dispatches to will accept.
+    """Conservative page sizes for the shared runner's default allocation.
 
-    Same shape as vLLM's ``AttentionBackend.get_supported_kernel_block_sizes``
-    -- a plain int is that exact size, ``MultipleOf(b)`` is any positive
-    multiple of ``b`` -- but answered here rather than read off a backend,
-    because AR-Diffusion does not go through backend selection. It calls
-    ``flash_attn_varlen_func`` itself, choosing between vLLM's CUDA build and
-    ROCm's AITER a few lines below, and only this module knows which.
+    The result follows vLLM's backend vocabulary: an integer is an exact size,
+    and ``MultipleOf(b)`` permits positive multiples of ``b``. Multiples of 16
+    retain the common allocation contract across the existing platform routes.
 
-    It lives next to that choice so there is one place to change. The
-    constraint is a property of the kernel, not of the card, and the kernels
-    reachable from here agree on 16 today: vLLM's CUDA FlashAttention, ROCm
-    AITER, and upstream ``flash_attn`` all advertise ``MultipleOf(16)``. Other
-    backends in the same tree do not -- ``hpc_attn`` accepts only 64, and
-    FlashInfer advertises pages of 128 or more solely on Blackwell -- so a
-    caller must treat this as data to be queried, never as the number 16.
-
-    vLLM's FlashAttention backend does advertise a single 128-token page when FA4
-    runs its dedicated head-size-256 kernel on SM100/SM110. That kernel is not
-    reachable from here: ``get_flash_attn_version`` selects it only when the
-    caller passes ``supports_fa4_hd256=True``, and :func:`_resolve_fa_version`
-    does not, so a head size of 256 falls back to FA2, which pages at any
-    multiple of 16. Passing that flag later has to change this answer as well.
+    A specific backend may support additional sizes. Models can declare those
+    through ``ARDiffusionKVCacheSpec.supported_block_sizes``; the attention
+    route must support the resulting allocation. In particular, a direct paged
+    route rejects incompatible page sizes instead of gathering K/V to work
+    around a backend restriction.
     """
     from vllm.v1.attention.backend import MultipleOf
 
@@ -718,11 +708,14 @@ def ar_diffusion_paged_attention(
     reuse_history: bool = False,
     current_tokens: int = 0,
     stage_first_block: int = 0,
+    require_paged: bool = False,
 ) -> torch.Tensor:
     """Run non-causal paged attention over a vLLM block table.
 
     ``query`` may be ``(B, L, H, D)`` or already flattened as ``(T, H, D)``.
     ``key_cache`` / ``value_cache`` are ``(num_blocks, block_size, H, D)``.
+    ``require_paged`` rejects reference and gathered routes for callers whose
+    attention contract requires the backend to consume physical page tables.
     """
     batched = query.dim() == 4
     if batched:
@@ -730,6 +723,13 @@ def ar_diffusion_paged_attention(
         query_flat = query.reshape(batch * q_len, *query.shape[2:])
     else:
         query_flat = query
+
+    if require_paged and (
+        not query_flat.is_cuda
+        or torch.version.hip is not None
+        or (contiguous_kv_gather_enabled() and block_table.shape[0] == 1)
+    ):
+        raise RuntimeError("Direct paged attention is required; the selected route uses reference or gathered K/V")
 
     if query_flat.device.type == "npu":
         # NPU: gather the visible blocks on device, then run the fused
@@ -891,6 +891,11 @@ def ar_diffusion_paged_attention(
         from vllm.vllm_flash_attn import flash_attn_varlen_func as paged_flash_attn_varlen_func
 
         fa_version = _resolve_fa_version(query_flat.shape[-1])
+        if require_paged and fa_version in (2, 3) and key_cache.shape[1] % 16:
+            raise ValueError(
+                f"Selected paged attention backend (FlashAttention {fa_version}) requires a page size "
+                f"divisible by 16; got {key_cache.shape[1]}"
+            )
 
         out = torch.empty_like(query_flat)
         paged_flash_attn_varlen_func(
@@ -942,6 +947,7 @@ def _paged_write_attn_impl(
     stage_value: torch.Tensor | None = None,
     reuse_history: bool = False,
     stage_first_block: int = 0,
+    require_paged: bool = False,
 ) -> torch.Tensor:
     key_pool[video_slots] = k_curr.to(key_pool.dtype)
     value_pool[video_slots] = v_curr.to(value_pool.dtype)
@@ -966,6 +972,7 @@ def _paged_write_attn_impl(
         reuse_history=reuse_history,
         current_tokens=int(k_curr.shape[0]),
         stage_first_block=stage_first_block,
+        require_paged=require_paged,
     )
 
 
@@ -1000,6 +1007,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         stage_value: torch.Tensor | None,
         reuse_history: bool,
         stage_first_block: int,
+        require_paged: bool,
     ) -> torch.Tensor:
         return _paged_write_attn_impl(
             query,
@@ -1022,6 +1030,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
             stage_value,
             reuse_history,
             stage_first_block,
+            require_paged,
         )
 
     @_paged_write_attn_op.register_fake
@@ -1046,6 +1055,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         stage_value=None,
         reuse_history=False,
         stage_first_block=0,
+        require_paged=False,
     ):
         return torch.empty_like(query)
 
@@ -1075,4 +1085,5 @@ def paged_write_attn(
         inputs.stage_value,
         inputs.reuse_history,
         inputs.stage_first_block,
+        inputs.require_paged,
     )

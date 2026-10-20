@@ -224,6 +224,7 @@ def create_base_diffusion_vllm_config(
     return VllmConfig(
         compilation_config=CompilationConfig(),
         device_config=DeviceConfig(device=device),
+        attention_config=od_config.ar_attention_config,
         additional_config=od_config.additional_config,
         kernel_config=KernelConfig(moe_backend=od_config.moe_backend, linear_backend=od_config.linear_backend),
     )

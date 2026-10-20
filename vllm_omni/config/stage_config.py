@@ -601,6 +601,7 @@ class StageDeployConfig:
     diffusion_quantization_config: str | None = None
     diffusion_attention_backend: str | None = None
     fastvideo_vsa_topk: int | None = None
+    ar_attention_config: dict[str, Any] | None = None
     diffusion_attention_config: dict[str, Any] | None = None
 
     # Diffusion execution, cache, and VAE behavior.
@@ -843,6 +844,8 @@ class DeployConfig:
     pipeline_parallel_size: int | None = None
     custom_voice_dir: str | None = None
     weight_transfer_config: dict[str, Any] | None = None
+    default_resolution: list[int] | tuple[int, int] | None = None
+    max_pixels: int | None = None
 
 
 _STAGE_RESERVED_KEYS = frozenset(
@@ -876,6 +879,8 @@ PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "pipeline_parallel_size",
     "active_stream_window",
     "custom_voice_dir",
+    "default_resolution",
+    "max_pixels",
     "weight_transfer_config",
 )
 

@@ -9,11 +9,31 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from vllm_omni.errors import OmniClientError
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.experimental.ar_diffusion.cell_executor import ARDiffusionCellContext
     from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
     from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+
+
+AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE = "ARDiffusionRequestRejectedError"
+
+
+class ARDiffusionRequestRejectedError(OmniClientError):
+    """A request failed admission validation before any state was touched.
+
+    Pipelines raise this for fail-closed rejections (session-fingerprint
+    mismatch, out-of-order chunk index, over-long prompt, wrong resolution,
+    malformed inputs). The contract: no session state, KV pool content, or
+    accounting was modified, so the runner must surface the error WITHOUT
+    releasing the session — the client keeps its paid-for KV history and can
+    retry a corrected request or explicitly reset.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, error_type=AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE)
 
 
 @dataclass(frozen=True)
@@ -137,6 +157,8 @@ class ARDiffusionKVCacheSpec:
     max_scratch_tokens_per_branch: int = 0
     model_owned_state_bytes_per_session: int = 0
     segmented: ARDiffusionSegmentedKVSpec | None = None
+    # Optional page sizes declared by the model's attention backend.
+    supported_block_sizes: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         positive_fields = {
@@ -149,6 +171,10 @@ class ARDiffusionKVCacheSpec:
             "session_capacity": self.session_capacity,
             "max_model_len": self.max_model_len,
         }
+        if self.supported_block_sizes is not None and (
+            not self.supported_block_sizes or any(size <= 0 for size in self.supported_block_sizes)
+        ):
+            raise ValueError("Attention backend block sizes must be nonempty and positive")
         for name, value in positive_fields.items():
             if value <= 0:
                 raise ValueError(f"AR-Diffusion {name} must be positive, got {value}")
@@ -191,6 +217,41 @@ class ARDiffusionKVCacheSpec:
     def cross_attention_kv_heads(self) -> dict[str, int]:
         """Per-cache head counts, for the caches that do not use the self-attention head count."""
         return {cache.name: cache.num_kv_heads for cache in self.cross_attention if cache.num_kv_heads is not None}
+
+
+@dataclass(frozen=True)
+class ARDiffusionRequestKVSpec:
+    """Request-specific KV requirements plus an opaque session geometry key."""
+
+    kv_spec: ARDiffusionKVCacheSpec
+    geometry_key: object
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kv_spec, ARDiffusionKVCacheSpec):
+            raise TypeError(
+                f"AR-Diffusion request kv_spec must be ARDiffusionKVCacheSpec, got {type(self.kv_spec).__name__}"
+            )
+
+
+@runtime_checkable
+class SupportsDynamicARDiffusion(Protocol):
+    """Optional capability for pipelines whose KV geometry varies per request."""
+
+    def ar_diffusion_default_request_spec(self) -> ARDiffusionRequestKVSpec:
+        """Return the request spec used for initial pool allocation."""
+        ...
+
+    def ar_diffusion_request_spec(self, request: OmniDiffusionRequest) -> ARDiffusionRequestKVSpec:
+        """Resolve one serialized request before runner session admission."""
+        ...
+
+    def ar_diffusion_worst_case_request_specs(self) -> Iterable[ARDiffusionRequestKVSpec]:
+        """Yield model-computed worst-case specs for startup capacity validation."""
+        ...
+
+    def validate_ar_diffusion_effective_spec(self, spec: ARDiffusionKVCacheSpec) -> None:
+        """Validate the runner's effective structure after deployment overrides."""
+        ...
 
 
 @runtime_checkable

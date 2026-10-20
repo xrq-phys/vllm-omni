@@ -19,6 +19,7 @@ import torch
 from PIL import Image
 from pydantic import model_validator
 from typing_extensions import Self
+from vllm.config import AttentionConfig as VllmAttentionConfig
 from vllm.config import KernelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -847,6 +848,14 @@ class OmniDiffusionConfig:
     model_config: dict[str, Any] = field(default_factory=dict)
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
 
+    # Optional request-geometry policy. Model-specific pipelines decide
+    # whether and how these deployment values apply.
+    default_resolution: list[int] | tuple[int, int] | None = None
+    max_pixels: int | None = None
+
+    # Native vLLM settings for autoregressive attention.
+    ar_attention_config: VllmAttentionConfig = field(default_factory=VllmAttentionConfig)
+
     # Attention
     diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
     fa_deterministic: bool = False
@@ -1445,6 +1454,10 @@ class OmniDiffusionConfig:
 
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
+        if isinstance(self.ar_attention_config, Mapping):
+            self.ar_attention_config = VllmAttentionConfig(**dict(self.ar_attention_config))
+        elif not isinstance(self.ar_attention_config, VllmAttentionConfig):
+            raise TypeError("ar_attention_config must be a native vLLM AttentionConfig or mapping")
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
         validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)

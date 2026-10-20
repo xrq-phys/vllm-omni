@@ -1304,3 +1304,20 @@ def test_contiguous_kv_gather_path_matches_paged_path_gpu(monkeypatch, history_c
     assert torch.isfinite(gathered).all()
     # Same kernel family on the same K/V: only accumulation order differs.
     torch.testing.assert_close(gathered, paged, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.cpu
+def test_require_paged_rejects_reference_attention():
+    with pytest.raises(RuntimeError, match="Direct paged attention is required"):
+        ar_diffusion_paged_attention(
+            torch.zeros(1, 1, 8),
+            torch.zeros(2, 16, 1, 8),
+            torch.zeros(2, 16, 1, 8),
+            block_table=torch.tensor([[1]], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            max_query_len=1,
+            max_seq_len=16,
+            softmax_scale=8**-0.5,
+            require_paged=True,
+        )

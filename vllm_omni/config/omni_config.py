@@ -21,6 +21,7 @@ from typing import Any, Literal, TypeAlias, TypedDict, cast
 import regex as re
 from pydantic import ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Self
+from vllm.config import AttentionConfig as VllmAttentionConfig
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
 from vllm.config import KernelConfig, KVTransferConfig
@@ -826,6 +827,9 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     port: int | None = None
     model_config: dict[str, Any] = field(default_factory=dict)
     tf_model_config: Any = None
+    default_resolution: list[int] | tuple[int, int] | None = None
+    max_pixels: int | None = None
+    ar_attention_config: VllmAttentionConfig = field(default_factory=VllmAttentionConfig)
     diffusion_attention_config: Any = None
     cache_strategy: str = "none"
     cache_backend: str = "none"

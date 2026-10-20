@@ -313,3 +313,11 @@ def test_additional_config_roundtrip():
     additional_config = {"torchair_graph_config": {"enabled": True}}
     od = _roundtrip_diffusion_config(model="x", additional_config=additional_config)
     assert od.additional_config == additional_config
+
+
+def test_ar_attention_config_roundtrip():
+    from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
+
+    config = _roundtrip_diffusion_config(model="test", ar_attention_config={"flash_attn_version": 4})
+    native = create_diffusion_vllm_config(torch.device("cpu"), config)
+    assert native.attention_config.flash_attn_version == 4

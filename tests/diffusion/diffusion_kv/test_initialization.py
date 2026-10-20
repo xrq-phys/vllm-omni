@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm.config import AttentionConfig
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 import vllm_omni.diffusion.diffusion_kv.initialization as initialization
@@ -50,6 +51,7 @@ def _od_config(**overrides):
         moe_backend="auto",
         linear_backend="auto",
         additional_config={},
+        ar_attention_config=AttentionConfig(),
         profiler_config=None,
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1,
